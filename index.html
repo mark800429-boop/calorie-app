@@ -14,12 +14,16 @@
   <link rel="manifest" href="manifest.json" />
   <link rel="apple-touch-icon" href="icon-180.png" />
 
-  <!-- React 18 + Babel(單檔部署,免建置) -->
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.3.1/umd/react.production.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.3.1/umd/react-dom.production.min.js"></script>
-  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.26.2/babel.min.js"></script>
-  <!-- Tailwind CDN(沿用原本的 className 寫法) -->
-  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- React 18 + Babel(單檔部署,免建置)
+       全部自行託管於 vendor/,不從 CDN 載入:
+       API key 存在 localStorage,任何一個 CDN 被入侵都能讀走它。
+       附帶好處是斷網也能開(PWA 該有的行為)。
+       版本: React 18.3.1 / Babel standalone 7.26.2 / Tailwind Play CDN -->
+  <script src="./vendor/react.production.min.js"></script>
+  <script src="./vendor/react-dom.production.min.js"></script>
+  <script src="./vendor/babel.min.js"></script>
+  <!-- Tailwind(沿用原本的 className 寫法) -->
+  <script src="./vendor/tailwind.min.js"></script>
 
   <style>
     html, body { margin: 0; padding: 0; background: #FBF6E3; }
