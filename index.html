@@ -258,7 +258,9 @@
         new Promise((res, rej) => {
           if (window.heic2any) return res(window.heic2any);
           const s = document.createElement("script");
-          s.src = "https://cdnjs.cloudflare.com/ajax/libs/heic2any/0.0.4/heic2any.min.js";
+          // 自行託管（原本從 cdnjs 載入）：CDN 若被入侵，注入的腳本能讀到
+          // localStorage 裡的 API key。相對路徑讓 GitHub Pages 的子路徑也能運作。
+          s.src = "./vendor/heic2any.min.js";
           s.onload = () => res(window.heic2any);
           s.onerror = () => rej(new Error("heic2any load failed"));
           document.head.appendChild(s);
