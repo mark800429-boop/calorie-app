@@ -85,9 +85,38 @@
       { id: "snack", label: "小食/其他", icon: "🌙" },
     ];
 
-    const DAILY_GOAL = 2000;
     const WEEKDAYS = ["一", "二", "三", "四", "五", "六", "日"];
     const API_KEY_STORAGE = "anthropic_api_key";
+    // 雲端同步網址(選填;沒填就完全不同步,行為跟舊版一樣)
+    const SYNC_URL_STORAGE = "sync_url";
+    // 每日營養目標(可在設定頁自訂;沒設定就用預設值)
+    const GOALS_STORAGE = "daily_goals";
+    const DEFAULT_GOALS = { kcal: 2000, carbs: 250, protein: 60, fat: 65 };
+    const loadGoals = () => {
+      try {
+        return { ...DEFAULT_GOALS, ...JSON.parse(localStorage.getItem(GOALS_STORAGE) || "{}") };
+      } catch {
+        return { ...DEFAULT_GOALS };
+      }
+    };
+
+    // 同步時不送縮圖,只送數字與文字
+    const stripThumbs = (log) => {
+      const out = {};
+      Object.keys(log || {}).forEach((meal) => {
+        out[meal] = (log[meal] || []).map(({ thumb, ...rest }) => rest);
+      });
+      return out;
+    };
+
+    // 送到 Google Apps Script。用 text/plain + no-cors 避開跨網域預檢,送出即可、不讀回應
+    const postSync = (url, payload) =>
+      fetch(url, {
+        method: "POST",
+        mode: "no-cors",
+        headers: { "Content-Type": "text/plain;charset=utf-8" },
+        body: JSON.stringify(payload),
+      });
 
     const round1 = (n) => Math.round((Number(n) || 0) * 10) / 10;
     const pad2 = (x) => String(x).padStart(2, "0");
@@ -154,6 +183,14 @@
       // API 金鑰(每個使用者自己輸入,只存在自己手機的 localStorage)
       const [apiKey, setApiKey] = useState(() => localStorage.getItem(API_KEY_STORAGE) || "");
       const [keyInput, setKeyInput] = useState("");
+
+      // 雲端同步與每日目標
+      const [syncUrl, setSyncUrl] = useState(() => localStorage.getItem(SYNC_URL_STORAGE) || "");
+      const [syncInput, setSyncInput] = useState("");
+      const [syncMsg, setSyncMsg] = useState("");
+      const [goals, setGoals] = useState(loadGoals);
+      const [goalInput, setGoalInput] = useState(loadGoals);
+      const DAILY_GOAL = goals.kcal;
 
       const [imageData, setImageData] = useState(null);
       const [previewUrl, setPreviewUrl] = useState(null);
@@ -224,6 +261,75 @@
           setError("紀錄儲存失敗,可能是儲存空間已滿。可刪除較舊的紀錄後再試。");
         }
         syncSummary(selectedDate, dayCalOf(next));
+        // 有設定同步網址才送出;送整天的紀錄,刪除也會跟著同步
+        if (syncUrl) {
+          postSync(syncUrl, { date: selectedDate, log: stripThumbs(next) }).catch(() => {});
+        }
+      };
+
+      // ---------- 雲端同步管理 ----------
+      const saveSyncUrl = () => {
+        const u = syncInput.trim();
+        if (!u) return;
+        localStorage.setItem(SYNC_URL_STORAGE, u);
+        setSyncUrl(u);
+        setSyncInput("");
+        setSyncMsg("");
+      };
+
+      const clearSyncUrl = () => {
+        localStorage.removeItem(SYNC_URL_STORAGE);
+        setSyncUrl("");
+        setSyncMsg("");
+      };
+
+      const testSync = async () => {
+        setSyncMsg("測試中…");
+        try {
+          const sep = syncUrl.includes("?") ? "&" : "?";
+          const r = await fetch(`${syncUrl}${sep}action=ping`);
+          const j = await r.json();
+          setSyncMsg(j.ok ? "✓ 連線成功" : `連線失敗:${j.error || "未知錯誤"}`);
+        } catch (e) {
+          setSyncMsg(`連線失敗(${e.message})`);
+        }
+      };
+
+      // 把手機裡所有舊紀錄一次補傳(每批 20 天)
+      const backfillSync = async () => {
+        const days = [];
+        for (let i = 0; i < localStorage.length; i++) {
+          const k = localStorage.key(i);
+          if (!k || !k.startsWith("app:log:")) continue;
+          try {
+            days.push({ date: k.slice(8), log: stripThumbs(JSON.parse(localStorage.getItem(k))) });
+          } catch {}
+        }
+        days.sort((a, b) => (a.date < b.date ? -1 : 1));
+        if (!days.length) {
+          setSyncMsg("手機裡沒有舊紀錄可補傳");
+          return;
+        }
+        setSyncMsg(`補傳中…(共 ${days.length} 天)`);
+        try {
+          for (let i = 0; i < days.length; i += 20) {
+            await postSync(syncUrl, { days: days.slice(i, i + 20) });
+          }
+          setSyncMsg(`✓ 已送出 ${days.length} 天的紀錄`);
+        } catch (e) {
+          setSyncMsg(`補傳失敗(${e.message})`);
+        }
+      };
+
+      const saveGoals = () => {
+        const g = {};
+        Object.keys(DEFAULT_GOALS).forEach((k) => {
+          const v = Number(goalInput[k]);
+          g[k] = v > 0 ? v : DEFAULT_GOALS[k];
+        });
+        localStorage.setItem(GOALS_STORAGE, JSON.stringify(g));
+        setGoals(g);
+        setGoalInput(g);
       };
 
       // ---------- API 金鑰管理 ----------
@@ -496,6 +602,87 @@
 
               <div className="text-xs mt-4 px-2" style={{ color: T.lightBrown, lineHeight: 1.7 }}>
                 沒有金鑰也可以使用日記與月曆功能,只是無法用照片自動分析。
+              </div>
+
+              {/* 每日營養目標 */}
+              <div className="w-full p-5 mt-4" style={cardStyle}>
+                <div className="text-base mb-2" style={{ fontWeight: 900 }}>每日營養目標</div>
+                <div className="text-xs mb-3" style={{ color: T.lightBrown, lineHeight: 1.7 }}>
+                  首頁的圓環會依這裡的目標計算。蛋白質建議每公斤體重 1.6～2 克。
+                </div>
+                {[
+                  ["kcal", "🔥 熱量(大卡)"],
+                  ["carbs", "🍞 碳水(克)"],
+                  ["protein", "🍗 蛋白質(克)"],
+                  ["fat", "🥑 脂肪(克)"],
+                ].map(([k, label]) => (
+                  <div key={k} className="flex items-center justify-between mb-2">
+                    <span className="text-sm" style={{ fontWeight: 700 }}>{label}</span>
+                    <input
+                      type="number"
+                      inputMode="numeric"
+                      value={goalInput[k]}
+                      onChange={(e) => setGoalInput({ ...goalInput, [k]: e.target.value })}
+                      className="px-3 py-2 text-sm text-right"
+                      style={{
+                        width: 110, borderRadius: 12, border: `2px solid ${T.track}`,
+                        background: T.bg, color: T.brown, outline: "none",
+                      }}
+                    />
+                  </div>
+                ))}
+                <button onClick={saveGoals} className="w-full py-3 mt-2 text-base" style={btnStyle}>
+                  儲存目標
+                </button>
+              </div>
+
+              {/* 雲端同步(選填) */}
+              <div className="w-full p-5 mt-4" style={cardStyle}>
+                <div className="text-base mb-2" style={{ fontWeight: 900 }}>雲端同步(選填)</div>
+                <div className="text-xs mb-4" style={{ color: T.lightBrown, lineHeight: 1.7 }}>
+                  填入自己的 Google 試算表同步網址後,每次新增或刪除紀錄都會自動備份到試算表。
+                  不填就完全不會上傳任何資料。
+                </div>
+                {syncUrl ? (
+                  <div>
+                    <div className="mb-3 px-3 py-2 text-sm"
+                      style={{ background: "#EDF5EC", color: T.green, borderRadius: 12, fontWeight: 800 }}>
+                      ✓ 已開啟同步
+                    </div>
+                    <div className="flex gap-2 mb-2">
+                      <button onClick={testSync} className="flex-1 py-2 text-sm" style={btnOutline}>
+                        測試連線
+                      </button>
+                      <button onClick={backfillSync} className="flex-1 py-2 text-sm" style={btnOutline}>
+                        補傳舊紀錄
+                      </button>
+                    </div>
+                    {syncMsg && (
+                      <div className="text-sm mb-2" style={{ color: T.brown, fontWeight: 700 }}>{syncMsg}</div>
+                    )}
+                    <button onClick={clearSyncUrl} className="px-5 py-2 text-sm"
+                      style={{ ...btnOutline, border: `2px solid ${T.red}`, color: T.red }}>
+                      關閉同步
+                    </button>
+                  </div>
+                ) : (
+                  <div>
+                    <input
+                      type="url"
+                      value={syncInput}
+                      onChange={(e) => setSyncInput(e.target.value)}
+                      placeholder="https://script.google.com/macros/s/.../exec?key=..."
+                      className="w-full px-4 py-3 mb-3 text-sm"
+                      style={{
+                        borderRadius: 12, border: `2px solid ${T.track}`,
+                        background: T.bg, color: T.brown, outline: "none",
+                      }}
+                    />
+                    <button onClick={saveSyncUrl} className="w-full py-3 text-base" style={btnStyle}>
+                      開啟同步
+                    </button>
+                  </div>
+                )}
               </div>
             </div>
           </div>
@@ -782,9 +969,9 @@
               </div>
               <div className="flex justify-between">
                 <Donut value={dayTotals.cal} fraction={dayTotals.cal / DAILY_GOAL} label="🔥 熱量" color={T.orange} />
-                <Donut value={dayTotals.carbs} fraction={dayTotals.carbs / 250} label="🍞 碳水" color={T.teal} />
-                <Donut value={dayTotals.protein} fraction={dayTotals.protein / 60} label="🍗 蛋白" color={T.yellow} />
-                <Donut value={dayTotals.fat} fraction={dayTotals.fat / 65} label="🥑 脂肪" color={T.red} />
+                <Donut value={dayTotals.carbs} fraction={dayTotals.carbs / goals.carbs} label="🍞 碳水" color={T.teal} />
+                <Donut value={dayTotals.protein} fraction={dayTotals.protein / goals.protein} label="🍗 蛋白" color={T.yellow} />
+                <Donut value={dayTotals.fat} fraction={dayTotals.fat / goals.fat} label="🥑 脂肪" color={T.red} />
               </div>
             </div>
 
