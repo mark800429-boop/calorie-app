@@ -104,7 +104,8 @@
     const stripThumbs = (log) => {
       const out = {};
       Object.keys(log || {}).forEach((meal) => {
-        out[meal] = (log[meal] || []).map(({ thumb, ...rest }) => rest);
+        // 縮圖與原始估算（baseItems）只留在手機，不上傳
+        out[meal] = (log[meal] || []).map(({ thumb, baseItems, ...rest }) => rest);
       });
       return out;
     };
@@ -504,6 +505,7 @@
           const next = { ...dayLog, [activeMeal]: [...(dayLog[activeMeal] || []), entry] };
           await persist(next);
           setSaved(true);
+          setExpandedId(entry.id); // 回日記時這筆直接展開，方便調整份量
         } catch (e) {
           setError(`連線失敗(${e.message})。請確認網路正常、API 金鑰正確。`);
         } finally {
@@ -515,6 +517,47 @@
         const next = { ...dayLog, [mealId]: (dayLog[mealId] || []).filter((e) => e.id !== entryId) };
         await persist(next);
       };
+
+      // ---------- 調整份量 ----------
+      // 把一樣食材的克數與營養素等比例放大縮小
+      const scaleItem = (it, f) => ({
+        ...it,
+        grams: round1((Number(it.grams) || 0) * f),
+        calories: Math.round((Number(it.calories) || 0) * f),
+        carbs_g: round1((Number(it.carbs_g) || 0) * f),
+        protein_g: round1((Number(it.protein_g) || 0) * f),
+        fat_g: round1((Number(it.fat_g) || 0) * f),
+      });
+
+      // 改一筆紀錄後存檔（persist 會一併同步到雲端）
+      const updateEntry = async (mealId, entryId, fn) => {
+        const next = {
+          ...dayLog,
+          [mealId]: (dayLog[mealId] || []).map((e) => (e.id === entryId ? fn(e) : e)),
+        };
+        await persist(next);
+      };
+
+      // 整份調整：一律從 AI 原始估算（baseItems）換算，按幾次都不會越算越偏
+      const setPortion = (mealId, entryId, f) =>
+        updateEntry(mealId, entryId, (x) => {
+          const base = x.baseItems || x.items || [];
+          return { ...x, baseItems: base, portion: f, items: base.map((it) => scaleItem(it, f)) };
+        });
+
+      // 單樣食材改克數：依新舊克數比例換算這一樣的營養素
+      const setItemGrams = (mealId, entryId, idx, value) =>
+        updateEntry(mealId, entryId, (x) => {
+          const cur = (x.items || [])[idx];
+          const g = Number(value);
+          if (!cur || !(g >= 0) || !(Number(cur.grams) > 0) || g === Number(cur.grams)) return x;
+          const items = x.items.map((it, i) => (i === idx ? scaleItem(it, g / Number(cur.grams)) : it));
+          return { ...x, baseItems: x.baseItems || x.items, portion: null, items };
+        });
+
+      const PORTIONS = [
+        [0.25, "¼"], [0.5, "½"], [0.75, "¾"], [1, "1 份"], [1.5, "1.5"], [2, "2 份"],
+      ];
 
       const openCapture = (mealId) => {
         setActiveMeal(mealId);
@@ -907,7 +950,7 @@
               {saved && (
                 <div className="flex gap-2">
                   <button onClick={() => setView("diary")} className="flex-1 py-3 text-base" style={btnStyle}>
-                    ✓ 返回日記
+                    ✓ 返回日記（可調份量）
                   </button>
                   <button onClick={() => openCapture(activeMeal)} className="px-4 py-3" style={btnOutline}>
                     再記一筆
@@ -1026,14 +1069,52 @@
                         </div>
                         {open && (
                           <div className="mt-2 pl-2">
+                            {/* 整份調整：實際只吃了一部分、或吃了兩份 */}
+                            <div className="flex items-center gap-1 mb-2 flex-wrap">
+                              <span className="text-xs mr-1" style={{ color: T.lightBrown, fontWeight: 700 }}>份量</span>
+                              {PORTIONS.map(([f, label]) => {
+                                const active = (e.portion ?? (e.baseItems ? null : 1)) === f;
+                                return (
+                                  <button key={f} onClick={() => setPortion(m.id, e.id, f)}
+                                    className="text-xs px-2 py-1"
+                                    style={{
+                                      borderRadius: 999, fontWeight: 800,
+                                      background: active ? T.orange : T.card,
+                                      color: active ? "#FFF" : T.brown,
+                                      border: `2px solid ${active ? T.orange : T.track}`,
+                                    }}>
+                                    {label}
+                                  </button>
+                                );
+                              })}
+                            </div>
                             {(e.items || []).map((it, idx) => (
-                              <div key={idx} className="flex justify-between text-xs py-1">
-                                <span>{it.emoji} {it.name} <span style={{ color: T.lightBrown }}>{round1(it.grams)}g</span></span>
+                              <div key={idx} className="flex justify-between items-center text-xs py-1">
+                                <span className="flex items-center gap-1">
+                                  {it.emoji} {it.name}
+                                  {/* 單樣食材改克數，離開欄位才存 */}
+                                  <input
+                                    key={`${e.id}-${idx}-${it.grams}`}
+                                    type="number" inputMode="decimal" defaultValue={round1(it.grams)}
+                                    onBlur={(ev) => setItemGrams(m.id, e.id, idx, ev.target.value)}
+                                    onKeyDown={(ev) => { if (ev.key === "Enter") ev.target.blur(); }}
+                                    aria-label={`${it.name}的克數`}
+                                    className="text-right"
+                                    style={{
+                                      width: 56, padding: "2px 4px", borderRadius: 8,
+                                      border: `1px solid ${T.track}`, background: T.bg, color: T.brown,
+                                    }}
+                                  />
+                                  <span style={{ color: T.lightBrown }}>g</span>
+                                </span>
                                 <span style={{ fontVariantNumeric: "tabular-nums" }}>
                                   🔥{Math.round(it.calories) || 0} 🍞{round1(it.carbs_g)} 🍗{round1(it.protein_g)} 🥑{round1(it.fat_g)}
                                 </span>
                               </div>
                             ))}
+                            <div className="text-xs mt-1" style={{ color: T.lightBrown }}>
+                              點份量按鈕整份換算；或直接改某樣食材的克數。
+                            </div>
                           </div>
                         )}
                       </div>
