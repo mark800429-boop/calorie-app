@@ -192,6 +192,36 @@
       const [goals, setGoals] = useState(loadGoals);
       const [goalInput, setGoalInput] = useState(loadGoals);
       const DAILY_GOAL = goals.kcal;
+      // 教練推送的今日目標說明（例如「減脂・休息（2026-10-21）」）
+      const [goalLabel, setGoalLabel] = useState(() => localStorage.getItem("daily_goals_label") || "");
+
+      // 有開雲端同步時，打開 App（或從背景切回來）就讀一次教練推送的目標
+      useEffect(() => {
+        if (!syncUrl) return;
+        const load = async () => {
+          try {
+            const sep = syncUrl.includes("?") ? "&" : "?";
+            const r = await fetch(`${syncUrl}${sep}action=goals`);
+            const j = await r.json();
+            const g = j && j.ok && j.goals;
+            if (!g || !(g.kcal > 0)) return;
+            const next = { kcal: g.kcal, carbs: g.carbs, protein: g.protein, fat: g.fat };
+            localStorage.setItem(GOALS_STORAGE, JSON.stringify(next));
+            // 今天的目標只顯示說明；不是今天推的才標日期，提醒教練還沒更新
+            const label = g.label ? `${g.label}${g.date && g.date !== todayStr() ? `（${g.date.slice(5)}）` : ""}` : "";
+            localStorage.setItem("daily_goals_label", label);
+            setGoals(next);
+            setGoalInput(next);
+            setGoalLabel(label);
+          } catch {
+            // 離線或同步網址失效：沿用手機上的目標
+          }
+        };
+        load();
+        const onVisible = () => { if (document.visibilityState === "visible") load(); };
+        document.addEventListener("visibilitychange", onVisible);
+        return () => document.removeEventListener("visibilitychange", onVisible);
+      }, [syncUrl]);
 
       const [imageData, setImageData] = useState(null);
       const [previewUrl, setPreviewUrl] = useState(null);
@@ -652,6 +682,7 @@
                 <div className="text-base mb-2" style={{ fontWeight: 900 }}>每日營養目標</div>
                 <div className="text-xs mb-3" style={{ color: T.lightBrown, lineHeight: 1.7 }}>
                   首頁的圓環會依這裡的目標計算。蛋白質建議每公斤體重 1.6～2 克。
+                  有開雲端同步時，教練推送的今日目標會自動覆蓋這裡的數字。
                 </div>
                 {[
                   ["kcal", "🔥 熱量(大卡)"],
@@ -1005,7 +1036,12 @@
             {/* 當日總覽 */}
             <div className="w-full p-4 mb-4" style={cardStyle}>
               <div className="flex justify-between items-center mb-3">
-                <span style={{ fontWeight: 900 }}>當日總覽</span>
+                <span style={{ fontWeight: 900 }}>
+                  當日總覽
+                  {goalLabel && (
+                    <span className="text-xs ml-2" style={{ color: T.orange, fontWeight: 800 }}>目標：{goalLabel}</span>
+                  )}
+                </span>
                 <span className="text-sm" style={{ color: T.lightBrown }}>
                   剩餘 <span style={{ color: T.orange, fontWeight: 900 }}>{Math.round(remaining)}</span> / {DAILY_GOAL} 大卡
                 </span>
