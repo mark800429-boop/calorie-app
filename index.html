@@ -1051,9 +1051,17 @@ ${NUTRI_JSON}
                           />
                           {!foodDb && <div className="text-xs" style={{ color: T.lightBrown }}>資料庫載入中…</div>}
                           {foodDb && foodQuery.trim() && searchFoods(foodQuery).length === 0 && (
-                            <div className="text-xs" style={{ color: T.lightBrown }}>
-                              找不到。連鎖店餐點可以改用「打字描述」讓 AI 估。
+                            <div className="text-xs mb-2" style={{ color: T.lightBrown }}>
+                              資料庫只有一般食材,沒有連鎖店或品牌餐點。
                             </div>
+                          )}
+                          {/* 找不到、或想直接估連鎖店餐點：帶著打的字切到打字描述 */}
+                          {foodQuery.trim() && (
+                            <button
+                              onClick={() => { setTextDesc(foodQuery.trim()); setManualTab("text"); }}
+                              className="w-full py-2 mb-2 text-sm" style={btnOutline}>
+                              ✍️ 用 AI 估算「{foodQuery.trim()}」
+                            </button>
                           )}
                           <div style={{ maxHeight: 320, overflowY: "auto" }}>
                             {searchFoods(foodQuery).map((f, i) => (
