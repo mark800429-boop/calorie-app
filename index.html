@@ -231,6 +231,13 @@
       const [result, setResult] = useState(null);
       const [saved, setSaved] = useState(false);
       const [error, setError] = useState(null);
+      // 沒拍到照片的記錄方式：db 資料庫／recent 吃過的／text 打字讓 AI 估
+      const [manualTab, setManualTab] = useState(null);
+      const [foodDb, setFoodDb] = useState(null);
+      const [foodQuery, setFoodQuery] = useState("");
+      const [pickedFood, setPickedFood] = useState(null);
+      const [pickGrams, setPickGrams] = useState("100");
+      const [textDesc, setTextDesc] = useState("");
       const cameraRef = useRef(null);
       const galleryRef = useRef(null);
 
@@ -452,31 +459,8 @@
         "anthropic-dangerous-direct-browser-access": "true",
       });
 
-      const analyze = async () => {
-        if (!imageData) return;
-        if (!apiKey) {
-          setView("settings");
-          return;
-        }
-        setLoading(true);
-        setError(null);
-        setResult(null);
-        try {
-          const response = await fetch("https://api.anthropic.com/v1/messages", {
-            method: "POST",
-            headers: apiHeaders(),
-            body: JSON.stringify({
-              model: "claude-sonnet-4-6",
-              max_tokens: 1500,
-              messages: [
-                {
-                  role: "user",
-                  content: [
-                    { type: "image", source: { type: "base64", media_type: "image/jpeg", data: imageData } },
-                    {
-                      type: "text",
-                      text: `你是營養分析師。請辨識照片中的食物,拆解成主要食材並估算營養。
-只回傳 JSON,不要任何其他文字、不要 markdown 圍欄。格式:
+      // 營養估算的回覆格式（照片與文字描述共用）
+      const NUTRI_JSON = `只回傳 JSON,不要任何其他文字、不要 markdown 圍欄。格式:
 {
   "food_name": "餐點名稱(繁體中文)",
   "items": [
@@ -486,61 +470,179 @@
   "confidence": "high" | "medium" | "low",
   "notes": "一句話說明估算依據或不確定之處(繁體中文)"
 }
-規則:items 依熱量由高至低排序,最多10項;單一食物(如一瓶飲料)items 就只有一項。
-如果照片中不是食物,回傳 {"error": "說明原因(繁體中文)"}。`,
-                    },
-                  ],
-                },
-              ],
-            }),
-          });
-          const raw = await response.text();
-          let data;
-          try {
-            data = JSON.parse(raw);
-          } catch {
-            setError(`API 回應異常 (HTTP ${response.status}):${raw.slice(0, 120) || "(空白回覆)"}`);
-            return;
+規則:items 依熱量由高至低排序,最多10項;單一食物(如一瓶飲料)items 就只有一項。`;
+
+      // 呼叫 Claude 估算營養，回傳解析好的 JSON；失敗時設定錯誤訊息並回傳 null
+      const askClaude = async (content) => {
+        const response = await fetch("https://api.anthropic.com/v1/messages", {
+          method: "POST",
+          headers: apiHeaders(),
+          body: JSON.stringify({
+            model: "claude-sonnet-4-6",
+            max_tokens: 1500,
+            messages: [{ role: "user", content }],
+          }),
+        });
+        const raw = await response.text();
+        let data;
+        try {
+          data = JSON.parse(raw);
+        } catch {
+          setError(`API 回應異常 (HTTP ${response.status}):${raw.slice(0, 120) || "(空白回覆)"}`);
+          return null;
+        }
+        if (data.error) {
+          if (response.status === 401) {
+            setError("API 金鑰無效或已過期,請到「設定」重新輸入。");
+          } else {
+            setError(`API 錯誤:${data.error.message || JSON.stringify(data.error)}`);
           }
-          if (data.error) {
-            if (response.status === 401) {
-              setError("API 金鑰無效或已過期,請到「設定」重新輸入。");
-            } else {
-              setError(`API 錯誤:${data.error.message || JSON.stringify(data.error)}`);
-            }
-            return;
-          }
-          const text = (data.content || []).map((i) => (i.type === "text" ? i.text : "")).join("");
-          const start = text.indexOf("{");
-          const end = text.lastIndexOf("}");
-          if (start === -1 || end === -1) {
-            setError(`AI 回覆格式異常:${text.slice(0, 120) || "(空白回覆)"}`);
-            return;
-          }
-          const parsed = JSON.parse(text.slice(start, end + 1));
-          if (parsed.error) {
-            setError(parsed.error);
-            return;
-          }
-          setResult(parsed);
-          const entry = {
-            id: `${Date.now()}`,
-            time: new Date().toTimeString().slice(0, 5),
-            food_name: parsed.food_name,
-            items: parsed.items || [],
-            confidence: parsed.confidence,
-            notes: parsed.notes,
-            thumb,
-          };
-          const next = { ...dayLog, [activeMeal]: [...(dayLog[activeMeal] || []), entry] };
-          await persist(next);
-          setSaved(true);
-          setExpandedId(entry.id); // 回日記時這筆直接展開，方便調整份量
+          return null;
+        }
+        const text = (data.content || []).map((i) => (i.type === "text" ? i.text : "")).join("");
+        const start = text.indexOf("{");
+        const end = text.lastIndexOf("}");
+        if (start === -1 || end === -1) {
+          setError(`AI 回覆格式異常:${text.slice(0, 120) || "(空白回覆)"}`);
+          return null;
+        }
+        const parsed = JSON.parse(text.slice(start, end + 1));
+        if (parsed.error) {
+          setError(parsed.error);
+          return null;
+        }
+        return parsed;
+      };
+
+      // 把一筆估算結果存進目前選的餐別（照片、文字、資料庫、吃過的都走這裡）
+      const saveEntry = async (parsed, entryThumb) => {
+        setResult(parsed);
+        const entry = {
+          id: `${Date.now()}`,
+          time: new Date().toTimeString().slice(0, 5),
+          food_name: parsed.food_name,
+          items: parsed.items || [],
+          confidence: parsed.confidence,
+          notes: parsed.notes,
+          thumb: entryThumb || null,
+        };
+        const next = { ...dayLog, [activeMeal]: [...(dayLog[activeMeal] || []), entry] };
+        await persist(next);
+        setSaved(true);
+        setExpandedId(entry.id); // 回日記時這筆直接展開，方便調整份量
+      };
+
+      const runEstimate = async (content, entryThumb) => {
+        if (!apiKey) {
+          setView("settings");
+          return;
+        }
+        setLoading(true);
+        setError(null);
+        setResult(null);
+        try {
+          const parsed = await askClaude(content);
+          if (parsed) await saveEntry(parsed, entryThumb);
         } catch (e) {
           setError(`連線失敗(${e.message})。請確認網路正常、API 金鑰正確。`);
         } finally {
           setLoading(false);
         }
+      };
+
+      const analyze = () => {
+        if (!imageData) return;
+        return runEstimate([
+          { type: "image", source: { type: "base64", media_type: "image/jpeg", data: imageData } },
+          {
+            type: "text",
+            text: `你是營養分析師。請辨識照片中的食物,拆解成主要食材並估算營養。\n${NUTRI_JSON}\n如果照片中不是食物,回傳 {"error": "說明原因(繁體中文)"}。`,
+          },
+        ], thumb);
+      };
+
+      // 沒拍到照片：用文字描述讓 AI 估（連鎖店餐點也適用）
+      const analyzeText = () => {
+        const desc = textDesc.trim();
+        if (!desc) return;
+        return runEstimate([{
+          type: "text",
+          text: `你是營養分析師。使用者沒有拍照,只用文字描述了吃的東西:「${desc}」。
+請依台灣常見份量估算(有寫品牌或連鎖店就依該店常見品項估),拆解成主要食材。描述裡有寫份量或容量就照寫的算。
+${NUTRI_JSON}
+如果描述的不是食物,回傳 {"error": "說明原因(繁體中文)"}。`,
+        }]);
+      };
+
+      // ---------- 沒拍到照片：食物資料庫、吃過的 ----------
+      const loadFoodDb = async () => {
+        if (foodDb) return;
+        try {
+          const r = await fetch("foods.json");
+          setFoodDb(await r.json());
+        } catch {
+          setError("食物資料庫載入失敗,請確認網路後再試。");
+        }
+      };
+
+      const searchFoods = (q) => {
+        const terms = q.trim().split(/\s+/).filter(Boolean);
+        if (!foodDb || !terms.length) return [];
+        const hits = foodDb.foods.filter((f) => {
+          const hay = `${f[0]} ${f[1]} ${f[2]}`;
+          return terms.every((w) => hay.includes(w));
+        });
+        // 名稱開頭就符合的排前面，再來是名稱短的
+        hits.sort((a, b) => (b[0].startsWith(terms[0]) - a[0].startsWith(terms[0])) || a[0].length - b[0].length);
+        return hits.slice(0, 30);
+      };
+
+      const addFromDb = async () => {
+        const f = pickedFood;
+        const g = Number(pickGrams);
+        if (!f || !(g > 0)) return;
+        const k = g / 100;
+        const r1 = (x) => Math.round(x * k * 10) / 10;
+        setError(null);
+        await saveEntry({
+          food_name: f[0],
+          items: [{
+            emoji: "🍽️", name: f[0] + (f[3] ? `(${f[3].split(/[,，]/)[0]})` : ""), grams: g,
+            calories: Math.round(f[4] * k), carbs_g: r1(f[5]), protein_g: r1(f[6]), fat_g: r1(f[7]),
+          }],
+          confidence: "high",
+          notes: "食藥署食品營養成分資料庫,依輸入克數換算",
+        });
+      };
+
+      // 從手機裡的舊紀錄整理「吃過的」：依次數多寡排序
+      const recentFoods = () => {
+        const map = {};
+        for (let i = 0; i < localStorage.length; i++) {
+          const k = localStorage.key(i);
+          if (!k || !k.startsWith("app:log:")) continue;
+          let log;
+          try { log = JSON.parse(localStorage.getItem(k)); } catch { continue; }
+          MEALS.forEach((m) => (log[m.id] || []).forEach((e) => {
+            if (!e.food_name || !(e.items || []).length) return;
+            const cur = map[e.food_name] || { count: 0, last: "", entry: e };
+            cur.count += 1;
+            const stamp = `${k.slice(8)} ${e.time || ""}`;
+            if (stamp > cur.last) { cur.last = stamp; cur.entry = e; }
+            map[e.food_name] = cur;
+          }));
+        }
+        return Object.values(map).sort((a, b) => b.count - a.count || (a.last < b.last ? 1 : -1)).slice(0, 30);
+      };
+
+      const addFromRecent = async (e) => {
+        setError(null);
+        await saveEntry({
+          food_name: e.food_name,
+          items: (e.items || []).map((it) => ({ ...it })),
+          confidence: e.confidence,
+          notes: "從吃過的紀錄再記一次",
+        }, e.thumb);
       };
 
       const deleteEntry = async (mealId, entryId) => {
@@ -598,6 +700,10 @@
         setResult(null);
         setSaved(false);
         setError(null);
+        setManualTab(null);
+        setPickedFood(null);
+        setFoodQuery("");
+        setTextDesc("");
       };
 
       // ---------- 樣式 ----------
@@ -917,6 +1023,136 @@
                 <input ref={galleryRef} type="file" accept="image/*" className="hidden"
                   onChange={(e) => { const f = e.target.files && e.target.files[0]; if (f) processFile(f); }} />
               </div>
+
+              {/* 沒拍到照片：資料庫、吃過的、打字讓 AI 估 */}
+              {!previewUrl && !saved && (
+                <div className="w-full p-4 mb-4" style={cardStyle}>
+                  <div className="text-sm mb-3" style={{ fontWeight: 900 }}>沒拍到照片？</div>
+                  <div className="flex gap-2 mb-3">
+                    {[["db", "🔎 食物資料庫"], ["recent", "🕘 吃過的"], ["text", "✍️ 打字描述"]].map(([k, label]) => (
+                      <button key={k}
+                        onClick={() => { setManualTab(k); setError(null); if (k === "db") loadFoodDb(); }}
+                        className="flex-1 py-2 text-xs"
+                        style={manualTab === k ? { ...btnStyle, boxShadow: "none" } : btnOutline}>
+                        {label}
+                      </button>
+                    ))}
+                  </div>
+
+                  {manualTab === "db" && (
+                    <div>
+                      {!pickedFood ? (
+                        <React.Fragment>
+                          <input
+                            value={foodQuery} onChange={(e) => setFoodQuery(e.target.value)}
+                            placeholder="輸入食物名稱,例如:白飯、雞胸、香蕉"
+                            className="w-full px-3 py-2 mb-2 text-sm"
+                            style={{ borderRadius: 12, border: `2px solid ${T.track}`, background: T.bg, color: T.brown, outline: "none" }}
+                          />
+                          {!foodDb && <div className="text-xs" style={{ color: T.lightBrown }}>資料庫載入中…</div>}
+                          {foodDb && foodQuery.trim() && searchFoods(foodQuery).length === 0 && (
+                            <div className="text-xs" style={{ color: T.lightBrown }}>
+                              找不到。連鎖店餐點可以改用「打字描述」讓 AI 估。
+                            </div>
+                          )}
+                          <div style={{ maxHeight: 320, overflowY: "auto" }}>
+                            {searchFoods(foodQuery).map((f, i) => (
+                              <button key={i} onClick={() => { setPickedFood(f); setPickGrams("100"); }}
+                                className="w-full text-left py-2 px-1"
+                                style={{ borderBottom: `1px solid ${T.track}` }}>
+                                <div className="text-sm" style={{ fontWeight: 800 }}>{f[0]}
+                                  {f[1] && <span className="text-xs ml-1" style={{ color: T.lightBrown, fontWeight: 400 }}>({f[1]})</span>}
+                                </div>
+                                <div className="text-xs" style={{ color: T.lightBrown }}>
+                                  {f[3] && `${f[3].slice(0, 24)}・`}每100g 🔥{Math.round(f[4])} 🍞{f[5]} 🍗{f[6]} 🥑{f[7]}
+                                </div>
+                              </button>
+                            ))}
+                          </div>
+                          {foodDb && (
+                            <div className="text-xs mt-2" style={{ color: T.lightBrown }}>
+                              資料來源:衛生福利部食品藥物管理署 食品營養成分資料庫
+                            </div>
+                          )}
+                        </React.Fragment>
+                      ) : (
+                        <div>
+                          <div className="text-sm mb-1" style={{ fontWeight: 900 }}>{pickedFood[0]}</div>
+                          <div className="text-xs mb-3" style={{ color: T.lightBrown }}>{pickedFood[3]}</div>
+                          <div className="flex items-center gap-2 mb-2">
+                            <span className="text-sm" style={{ fontWeight: 700 }}>份量</span>
+                            <input type="number" inputMode="decimal" value={pickGrams}
+                              onChange={(e) => setPickGrams(e.target.value)}
+                              aria-label="份量克數"
+                              className="px-3 py-2 text-sm text-right"
+                              style={{ width: 100, borderRadius: 12, border: `2px solid ${T.track}`, background: T.bg, color: T.brown, outline: "none" }} />
+                            <span className="text-sm">克</span>
+                          </div>
+                          {Number(pickGrams) > 0 && (
+                            <div className="text-sm mb-3" style={{ fontVariantNumeric: "tabular-nums" }}>
+                              🔥{Math.round(pickedFood[4] * pickGrams / 100)} 大卡
+                              🍞{(pickedFood[5] * pickGrams / 100).toFixed(1)}
+                              🍗{(pickedFood[6] * pickGrams / 100).toFixed(1)}
+                              🥑{(pickedFood[7] * pickGrams / 100).toFixed(1)}
+                            </div>
+                          )}
+                          <div className="flex gap-2">
+                            <button onClick={addFromDb} className="flex-1 py-3 text-base" style={btnStyle}>加入紀錄</button>
+                            <button onClick={() => setPickedFood(null)} className="px-4 py-3" style={btnOutline}>重選</button>
+                          </div>
+                        </div>
+                      )}
+                    </div>
+                  )}
+
+                  {manualTab === "recent" && (() => {
+                    const list = recentFoods();
+                    return list.length === 0 ? (
+                      <div className="text-xs" style={{ color: T.lightBrown }}>還沒有紀錄。</div>
+                    ) : (
+                      <div style={{ maxHeight: 360, overflowY: "auto" }}>
+                        {list.map(({ entry, count }) => {
+                          const s = sumItems(entry.items);
+                          return (
+                            <button key={entry.food_name} onClick={() => addFromRecent(entry)}
+                              className="w-full text-left py-2 px-1 flex items-center gap-2"
+                              style={{ borderBottom: `1px solid ${T.track}` }}>
+                              {entry.thumb ? (
+                                <img src={entry.thumb} alt="" style={{ width: 36, height: 36, borderRadius: 10, objectFit: "cover" }} />
+                              ) : (
+                                <div style={{ width: 36, height: 36, borderRadius: 10, background: T.track }} />
+                              )}
+                              <div className="flex-1">
+                                <div className="text-sm" style={{ fontWeight: 800 }}>{entry.food_name}</div>
+                                <div className="text-xs" style={{ color: T.lightBrown }}>
+                                  吃過 {count} 次・🔥{Math.round(s.cal)} 🍞{round1(s.carbs)} 🍗{round1(s.protein)} 🥑{round1(s.fat)}
+                                </div>
+                              </div>
+                              <span className="text-xs" style={{ color: T.orange, fontWeight: 800 }}>＋記一筆</span>
+                            </button>
+                          );
+                        })}
+                      </div>
+                    );
+                  })()}
+
+                  {manualTab === "text" && (
+                    <div>
+                      <textarea value={textDesc} onChange={(e) => setTextDesc(e.target.value)} rows={3}
+                        placeholder="例如:麥味登雞肉鬆餅堡、350ml 鮮奶茶半糖"
+                        className="w-full px-3 py-2 mb-2 text-sm"
+                        style={{ borderRadius: 12, border: `2px solid ${T.track}`, background: T.bg, color: T.brown, outline: "none" }} />
+                      <button onClick={analyzeText} disabled={loading || !textDesc.trim()} className="w-full py-3 text-base"
+                        style={{ ...btnStyle, background: loading ? T.lightBrown : T.orange }}>
+                        {loading ? "估算中…" : "✍️ 讓 AI 估算並記錄"}
+                      </button>
+                      <div className="text-xs mt-2" style={{ color: T.lightBrown }}>
+                        跟拍照一樣使用你的 API 金鑰,只送文字所以更便宜。寫越清楚(品牌、容量、甜度)越準。
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
 
               {previewUrl && !saved && (
                 <div className="flex gap-2 mb-4">
