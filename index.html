@@ -236,7 +236,9 @@
       const [foodDb, setFoodDb] = useState(null);
       const [foodQuery, setFoodQuery] = useState("");
       const [pickedFood, setPickedFood] = useState(null);
-      const [pickGrams, setPickGrams] = useState("100");
+      const [pickAmount, setPickAmount] = useState("100");
+      const [pickUnit, setPickUnit] = useState("g");
+      const [pickSweet, setPickSweet] = useState(0);
       const [textDesc, setTextDesc] = useState("");
       const cameraRef = useRef(null);
       const galleryRef = useRef(null);
@@ -464,13 +466,15 @@
 {
   "food_name": "餐點名稱(繁體中文)",
   "items": [
-    { "emoji": "一個代表食材的emoji", "name": "食材名稱(繁體中文)", "grams": 數字,
+    { "emoji": "一個代表食材的emoji", "name": "食材名稱(繁體中文)", "grams": 數字, "unit": "g" 或 "ml",
       "calories": 數字, "carbs_g": 數字, "protein_g": 數字, "fat_g": 數字 }
   ],
   "confidence": "high" | "medium" | "low",
   "notes": "一句話說明估算依據或不確定之處(繁體中文)"
 }
-規則:items 依熱量由高至低排序,最多10項;單一食物(如一瓶飲料)items 就只有一項。`;
+規則:items 依熱量由高至低排序,最多10項;單一食物(如一瓶飲料)items 就只有一項。
+飲料、湯、牛奶等液體 unit 填 "ml",grams 欄位填毫升數;固體 unit 填 "g"。
+含糖飲料要把糖單獨列成一項,名稱寫「糖」或「果糖」;有寫甜度(半糖、微糖…)就照甜度,沒寫就以全糖估。`;
 
       // 呼叫 Claude 估算營養，回傳解析好的 JSON；失敗時設定錯誤訊息並回傳 null
       const askClaude = async (content) => {
@@ -597,21 +601,66 @@ ${NUTRI_JSON}
         return hits.slice(0, 30);
       };
 
+      // 資料庫食物可選的單位。液體用毫升（依密度換成重量算營養），固體用克；
+      // 杯／碗／湯匙是家用單位，「份」是食藥署資料附的每份重量
+      const unitsFor = (f) => {
+        const liquid = f[9] === 1;
+        const density = /油/.test(f[0]) ? 0.92 : /乳|奶/.test(f[0]) ? 1.03 : 1.0;
+        const list = [
+          { k: "g", label: "克", weight: 1, show: "g" },
+          { k: "ml", label: "毫升", weight: density, show: "ml", ml: 1 },
+          { k: "cup", label: "杯（240 ml）", weight: 240 * density, show: "ml", ml: 240 },
+          { k: "tbsp", label: "湯匙（15 ml）", weight: 15 * density, show: "ml", ml: 15 },
+          liquid
+            ? { k: "bowl", label: "碗（250 ml）", weight: 250 * density, show: "ml", ml: 250 }
+            : { k: "bowl", label: "碗（約 200 g）", weight: 200, show: "g" },
+        ];
+        if (f[8] > 0) list.push({ k: "unit", label: `份（約 ${f[8]} g）`, weight: f[8], show: "g" });
+        return list;
+      };
+
+      const pickFood = (f) => {
+        setPickedFood(f);
+        // 液體預設 250 ml，固體預設 100 g
+        setPickUnit(f[9] === 1 ? "ml" : "g");
+        setPickAmount(f[9] === 1 ? "250" : "100");
+        setPickSweet(0); // 資料庫的茶、奶多是無糖原料，預設無糖
+      };
+
+      // 依選的數量與單位算出：實際重量（算營養用）、顯示用的數字與單位
+      const pickResult = () => {
+        const f = pickedFood;
+        const amt = Number(pickAmount);
+        if (!f || !(amt > 0)) return null;
+        const u = unitsFor(f).find((x) => x.k === pickUnit) || unitsFor(f)[0];
+        const weight = amt * u.weight;
+        const k = weight / 100;
+        return {
+          shown: u.show === "ml" ? Math.round(amt * u.ml) : Math.round(weight * 10) / 10,
+          unit: u.show,
+          kcal: Math.round(f[4] * k),
+          carbs: Math.round(f[5] * k * 10) / 10,
+          protein: Math.round(f[6] * k * 10) / 10,
+          fat: Math.round(f[7] * k * 10) / 10,
+        };
+      };
+
       const addFromDb = async () => {
         const f = pickedFood;
-        const g = Number(pickGrams);
-        if (!f || !(g > 0)) return;
-        const k = g / 100;
-        const r1 = (x) => Math.round(x * k * 10) / 10;
+        const r = pickResult();
+        if (!f || !r) return;
         setError(null);
+        const base = [{
+          emoji: "🍽️", name: f[0] + (f[3] ? `(${f[3].split(/[,，]/)[0]})` : ""),
+          grams: r.shown, unit: r.unit,
+          calories: r.kcal, carbs_g: r.carbs, protein_g: r.protein, fat_g: r.fat,
+        }];
         await saveEntry({
-          food_name: f[0],
-          items: [{
-            emoji: "🍽️", name: f[0] + (f[3] ? `(${f[3].split(/[,，]/)[0]})` : ""), grams: g,
-            calories: Math.round(f[4] * k), carbs_g: r1(f[5]), protein_g: r1(f[6]), fat_g: r1(f[7]),
-          }],
+          food_name: f[0] + (r.unit === "ml" && pickSweet > 0
+            ? `（${(SWEETNESS.find(([v]) => v === pickSweet) || [0, ""])[1]}）` : ""),
+          items: r.unit === "ml" ? withSweetness(base, pickSweet) : base,
           confidence: "high",
-          notes: "食藥署食品營養成分資料庫,依輸入克數換算",
+          notes: "食藥署食品營養成分資料庫,依輸入份量換算",
         });
       };
 
@@ -690,6 +739,33 @@ ${NUTRI_JSON}
       const PORTIONS = [
         [0.25, "¼"], [0.5, "½"], [0.75, "¾"], [1, "1 份"], [1.5, "1.5"], [2, "2 份"],
       ];
+
+      // 甜度：台灣手搖飲的分級，全糖以每 100 ml 約 8 g 糖估
+      const SWEETNESS = [[0, "無糖"], [0.3, "微糖"], [0.5, "半糖"], [0.7, "少糖"], [1, "全糖"]];
+      const SUGAR_PER_100ML = 8;
+      // 認得出來的「糖」項目（珍珠、粉圓這類配料不算）
+      const isSugarItem = (it) => /(果糖|砂糖|蔗糖|糖漿|糖水|^糖)/.test(it.name || "") && !/珍珠|粉圓|波霸/.test(it.name || "");
+      const hasLiquid = (items) => (items || []).some((it) => it.unit === "ml");
+
+      // 把糖拆成獨立一項：先拿掉原本的糖，再依液體毫升數與甜度補一項
+      const withSweetness = (items, level) => {
+        const rest = (items || []).filter((it) => !isSugarItem(it));
+        const ml = rest.filter((it) => it.unit === "ml").reduce((s, it) => s + (Number(it.grams) || 0), 0) || 500;
+        const sugar = Math.round(ml / 100 * SUGAR_PER_100ML * level);
+        if (sugar <= 0) return rest;
+        const label = (SWEETNESS.find(([v]) => v === level) || [0, ""])[1];
+        return [...rest, {
+          emoji: "🍬", name: `糖（${label}）`, grams: sugar, unit: "g",
+          calories: sugar * 4, carbs_g: sugar, protein_g: 0, fat_g: 0,
+        }];
+      };
+
+      // 已記錄的飲料改甜度；改完把目前內容當成新的原始份量
+      const setSweetness = (mealId, entryId, level) =>
+        updateEntry(mealId, entryId, (x) => {
+          const items = withSweetness(x.items, level);
+          return { ...x, items, baseItems: items, portion: 1, sweet: level };
+        });
 
       const openCapture = (mealId) => {
         setActiveMeal(mealId);
@@ -1065,7 +1141,7 @@ ${NUTRI_JSON}
                           )}
                           <div style={{ maxHeight: 320, overflowY: "auto" }}>
                             {searchFoods(foodQuery).map((f, i) => (
-                              <button key={i} onClick={() => { setPickedFood(f); setPickGrams("100"); }}
+                              <button key={i} onClick={() => pickFood(f)}
                                 className="w-full text-left py-2 px-1"
                                 style={{ borderBottom: `1px solid ${T.track}` }}>
                                 <div className="text-sm" style={{ fontWeight: 800 }}>{f[0]}
@@ -1089,21 +1165,41 @@ ${NUTRI_JSON}
                           <div className="text-xs mb-3" style={{ color: T.lightBrown }}>{pickedFood[3]}</div>
                           <div className="flex items-center gap-2 mb-2">
                             <span className="text-sm" style={{ fontWeight: 700 }}>份量</span>
-                            <input type="number" inputMode="decimal" value={pickGrams}
-                              onChange={(e) => setPickGrams(e.target.value)}
-                              aria-label="份量克數"
+                            <input type="number" inputMode="decimal" value={pickAmount}
+                              onChange={(e) => setPickAmount(e.target.value)}
+                              aria-label="份量數量"
                               className="px-3 py-2 text-sm text-right"
-                              style={{ width: 100, borderRadius: 12, border: `2px solid ${T.track}`, background: T.bg, color: T.brown, outline: "none" }} />
-                            <span className="text-sm">克</span>
+                              style={{ width: 80, borderRadius: 12, border: `2px solid ${T.track}`, background: T.bg, color: T.brown, outline: "none" }} />
+                            <select value={pickUnit} onChange={(e) => setPickUnit(e.target.value)}
+                              aria-label="單位"
+                              className="px-2 py-2 text-sm"
+                              style={{ borderRadius: 12, border: `2px solid ${T.track}`, background: T.bg, color: T.brown, outline: "none" }}>
+                              {unitsFor(pickedFood).map((u) => <option key={u.k} value={u.k}>{u.label}</option>)}
+                            </select>
                           </div>
-                          {Number(pickGrams) > 0 && (
-                            <div className="text-sm mb-3" style={{ fontVariantNumeric: "tabular-nums" }}>
-                              🔥{Math.round(pickedFood[4] * pickGrams / 100)} 大卡
-                              🍞{(pickedFood[5] * pickGrams / 100).toFixed(1)}
-                              🍗{(pickedFood[6] * pickGrams / 100).toFixed(1)}
-                              🥑{(pickedFood[7] * pickGrams / 100).toFixed(1)}
+                          {pickResult() && pickResult().unit === "ml" && (
+                            <div className="flex items-center gap-1 mb-2 flex-wrap">
+                              <span className="text-sm mr-1" style={{ fontWeight: 700 }}>甜度</span>
+                              {SWEETNESS.map(([v, label]) => (
+                                <button key={v} onClick={() => setPickSweet(v)} className="text-xs px-2 py-1"
+                                  style={{
+                                    borderRadius: 999, fontWeight: 800,
+                                    background: pickSweet === v ? T.orange : T.card,
+                                    color: pickSweet === v ? "#FFF" : T.brown,
+                                    border: `2px solid ${pickSweet === v ? T.orange : T.track}`,
+                                  }}>{label}</button>
+                              ))}
                             </div>
                           )}
+                          {(() => {
+                            const r = pickResult();
+                            return r && (
+                              <div className="text-sm mb-3" style={{ fontVariantNumeric: "tabular-nums" }}>
+                                <span style={{ color: T.lightBrown }}>{r.shown} {r.unit}・</span>
+                                🔥{r.kcal} 大卡　🍞{r.carbs}　🍗{r.protein}　🥑{r.fat}
+                              </div>
+                            );
+                          })()}
                           <div className="flex gap-2">
                             <button onClick={addFromDb} className="flex-1 py-3 text-base" style={btnStyle}>加入紀錄</button>
                             <button onClick={() => setPickedFood(null)} className="px-4 py-3" style={btnOutline}>重選</button>
@@ -1208,7 +1304,7 @@ ${NUTRI_JSON}
                       <div className="flex items-baseline gap-1">
                         <span>{it.emoji}</span>
                         <span style={{ fontWeight: 800 }}>{it.name}</span>
-                        <span className="text-xs" style={{ color: T.lightBrown }}>{round1(it.grams)}g</span>
+                        <span className="text-xs" style={{ color: T.lightBrown }}>{round1(it.grams)}{it.unit === "ml" ? "ml" : "g"}</span>
                       </div>
                       <div className="text-xs" style={{ fontVariantNumeric: "tabular-nums" }}>
                         🔥{Math.round(it.calories) || 0} 🍞{round1(it.carbs_g)} 🍗{round1(it.protein_g)} 🥑{round1(it.fat_g)}
@@ -1368,6 +1464,21 @@ ${NUTRI_JSON}
                                 );
                               })}
                             </div>
+                            {hasLiquid(e.items) && (
+                              <div className="flex items-center gap-1 mb-2 flex-wrap">
+                                <span className="text-xs mr-1" style={{ color: T.lightBrown, fontWeight: 700 }}>甜度</span>
+                                {SWEETNESS.map(([v, label]) => (
+                                  <button key={v} onClick={() => setSweetness(m.id, e.id, v)}
+                                    className="text-xs px-2 py-1"
+                                    style={{
+                                      borderRadius: 999, fontWeight: 800,
+                                      background: e.sweet === v ? T.orange : T.card,
+                                      color: e.sweet === v ? "#FFF" : T.brown,
+                                      border: `2px solid ${e.sweet === v ? T.orange : T.track}`,
+                                    }}>{label}</button>
+                                ))}
+                              </div>
+                            )}
                             {(e.items || []).map((it, idx) => (
                               <div key={idx} className="flex justify-between items-center text-xs py-1">
                                 <span className="flex items-center gap-1">
@@ -1385,7 +1496,7 @@ ${NUTRI_JSON}
                                       border: `1px solid ${T.track}`, background: T.bg, color: T.brown,
                                     }}
                                   />
-                                  <span style={{ color: T.lightBrown }}>g</span>
+                                  <span style={{ color: T.lightBrown }}>{it.unit === "ml" ? "ml" : "g"}</span>
                                 </span>
                                 <span style={{ fontVariantNumeric: "tabular-nums" }}>
                                   🔥{Math.round(it.calories) || 0} 🍞{round1(it.carbs_g)} 🍗{round1(it.protein_g)} 🥑{round1(it.fat_g)}
