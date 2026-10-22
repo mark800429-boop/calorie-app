@@ -100,6 +100,37 @@
       }
     };
 
+    // ---------- 依目標與今天的訓練算營養目標（與教練電腦端 nutrition_plan.py 同一套公式）----------
+    // 基礎代謝：Katch-McArdle（370 ＋ 21.6 × 去脂體重）；活動係數已用手錶實際消耗校正（打九折）
+    const PLAN_ACTIVITY = { "休息": 1.30, "重訓": 1.42, "上課": 1.65, "騎車": 1.30 };
+    const RIDE_KCAL_PER_HOUR = 550;
+    const PLAN_GOALS = {
+      "減脂": { adj: { "休息": -0.20, "重訓": -0.15, "上課": -0.10, "騎車": -0.05 }, protein: 2.2, fat: 0.8 },
+      "備賽": { adj: { "休息": -0.05, "重訓": -0.05, "上課": 0, "騎車": 0 }, protein: 1.9, fat: 0.9 },
+      "維持": { adj: { "休息": 0, "重訓": 0, "上課": 0, "騎車": 0 }, protein: 1.8, fat: 0.9 },
+      "增肌": { adj: { "休息": 0.05, "重訓": 0.12, "上課": 0.08, "騎車": 0.08 }, protein: 2.0, fat: 1.0 },
+    };
+    const calcPlan = (weight, bf, goal, day, hours) => {
+      const lbm = bf > 0 ? weight * (1 - bf / 100) : weight * 0.82;
+      const burn = (370 + 21.6 * lbm) * PLAN_ACTIVITY[day] + (day === "騎車" ? RIDE_KCAL_PER_HOUR * (hours || 0) : 0);
+      const g = PLAN_GOALS[goal];
+      let kcal = burn * (1 + g.adj[day]);
+      const protein = weight * g.protein;
+      let fat = weight * g.fat;
+      let carbs = (kcal - protein * 4 - fat * 9) / 4;
+      // 騎車日碳水至少每公斤 5 g；碳水上限每公斤 10 g，超出改由脂肪補
+      if (day === "騎車" && carbs < weight * 5) {
+        carbs = weight * 5;
+        kcal = protein * 4 + fat * 9 + carbs * 4;
+      }
+      if (carbs > weight * 10) {
+        fat += (carbs - weight * 10) * 4 / 9;
+        carbs = weight * 10;
+      }
+      const r10 = (x) => Math.round(x / 10) * 10;
+      return { kcal: r10(kcal), carbs: r10(carbs), protein: r10(protein), fat: Math.round(fat / 5) * 5 };
+    };
+
     // 同步時不送縮圖,只送數字與文字
     const stripThumbs = (log) => {
       const out = {};
@@ -195,6 +226,40 @@
       // 教練推送的今日目標說明（例如「減脂・休息（2026-10-21）」）
       const [goalLabel, setGoalLabel] = useState(() => localStorage.getItem("daily_goals_label") || "");
 
+      // 身體資料與目標選擇（存在手機）
+      const loadJSON = (k, d) => { try { return { ...d, ...JSON.parse(localStorage.getItem(k) || "{}") }; } catch { return d; } };
+      const [body, setBody] = useState(() => loadJSON("body_profile", { weight: "", bf: "" }));
+      const [bodyInput, setBodyInput] = useState(() => loadJSON("body_profile", { weight: "", bf: "" }));
+      const [plan, setPlan] = useState(() => loadJSON("goal_plan", { goal: "維持", day: "休息", hours: 2 }));
+      const [planMsg, setPlanMsg] = useState("");
+
+      // 依選的目標重算，並記下「今天是我自己選的」，教練推送就不會蓋掉
+      const applyPlan = (p, b = body) => {
+        setPlan(p);
+        localStorage.setItem("goal_plan", JSON.stringify(p));
+        const w = Number(b.weight);
+        if (!(w > 0)) {
+          setPlanMsg("先到 ⚙️ 設定填體重,才能幫你算");
+          return;
+        }
+        setPlanMsg("");
+        const next = calcPlan(w, Number(b.bf) || 0, p.goal, p.day, Number(p.hours) || 0);
+        const label = `${p.goal}・${p.day}${p.day === "騎車" ? ` ${p.hours} 小時` : ""}`;
+        localStorage.setItem(GOALS_STORAGE, JSON.stringify(next));
+        localStorage.setItem("daily_goals_label", label);
+        localStorage.setItem("goals_manual_date", todayStr());
+        setGoals(next);
+        setGoalInput(next);
+        setGoalLabel(label);
+      };
+
+      const saveBody = () => {
+        const b = { weight: bodyInput.weight, bf: bodyInput.bf };
+        localStorage.setItem("body_profile", JSON.stringify(b));
+        setBody(b);
+        applyPlan(plan, b);
+      };
+
       // 有開雲端同步時，打開 App（或從背景切回來）就讀一次教練推送的目標
       useEffect(() => {
         if (!syncUrl) return;
@@ -205,6 +270,8 @@
             const j = await r.json();
             const g = j && j.ok && j.goals;
             if (!g || !(g.kcal > 0)) return;
+            // 今天已經在 App 上自己選過目標，就以自己選的為準
+            if (localStorage.getItem("goals_manual_date") === todayStr()) return;
             const next = { kcal: g.kcal, carbs: g.carbs, protein: g.protein, fat: g.fat };
             localStorage.setItem(GOALS_STORAGE, JSON.stringify(next));
             // 今天的目標只顯示說明；不是今天推的才標日期，提醒教練還沒更新
@@ -859,6 +926,27 @@ ${NUTRI_JSON}
                 沒有金鑰也可以使用日記與月曆功能,只是無法用照片自動分析。
               </div>
 
+              {/* 身體資料：首頁選「目標」時用來計算 */}
+              <div className="w-full p-5 mt-4" style={cardStyle}>
+                <div className="text-base mb-2" style={{ fontWeight: 900 }}>身體資料</div>
+                <div className="text-xs mb-3" style={{ color: T.lightBrown, lineHeight: 1.7 }}>
+                  首頁選「目標」和「今天」時,會用這裡的體重和體脂率計算熱量與營養素。量了新的數字記得回來改。
+                  體脂率不知道可以留空。
+                </div>
+                {[["weight", "體重(公斤)"], ["bf", "體脂率(%)"]].map(([k, label]) => (
+                  <div key={k} className="flex items-center justify-between mb-2">
+                    <span className="text-sm" style={{ fontWeight: 700 }}>{label}</span>
+                    <input type="number" inputMode="decimal" value={bodyInput[k]}
+                      onChange={(e) => setBodyInput({ ...bodyInput, [k]: e.target.value })}
+                      aria-label={label} className="px-3 py-2 text-sm text-right"
+                      style={{ width: 110, borderRadius: 12, border: `2px solid ${T.track}`, background: T.bg, color: T.brown, outline: "none" }} />
+                  </div>
+                ))}
+                <button onClick={saveBody} className="w-full py-3 mt-2 text-base" style={btnStyle}>
+                  儲存並重算目標
+                </button>
+              </div>
+
               {/* 每日營養目標 */}
               <div className="w-full p-5 mt-4" style={cardStyle}>
                 <div className="text-base mb-2" style={{ fontWeight: 900 }}>每日營養目標</div>
@@ -1392,6 +1480,34 @@ ${NUTRI_JSON}
                 <Donut value={dayTotals.protein} fraction={dayTotals.protein / goals.protein} label="🍗 蛋白" color={T.yellow} />
                 <Donut value={dayTotals.fat} fraction={dayTotals.fat / goals.fat} label="🥑 脂肪" color={T.red} />
               </div>
+
+              {/* 目標與今天的訓練：一選就重算 */}
+              <div className="flex items-center gap-2 mt-3 pt-3 flex-wrap" style={{ borderTop: `1px solid ${T.track}` }}>
+                <span className="text-xs" style={{ color: T.lightBrown, fontWeight: 700 }}>目標</span>
+                <select value={plan.goal} onChange={(e) => applyPlan({ ...plan, goal: e.target.value })}
+                  aria-label="目標" className="text-sm px-2 py-1"
+                  style={{ borderRadius: 10, border: `2px solid ${T.track}`, background: T.bg, color: T.brown }}>
+                  {Object.keys(PLAN_GOALS).map((g) => <option key={g} value={g}>{g}</option>)}
+                </select>
+                <span className="text-xs ml-1" style={{ color: T.lightBrown, fontWeight: 700 }}>今天</span>
+                <select value={plan.day} onChange={(e) => applyPlan({ ...plan, day: e.target.value })}
+                  aria-label="今天的訓練" className="text-sm px-2 py-1"
+                  style={{ borderRadius: 10, border: `2px solid ${T.track}`, background: T.bg, color: T.brown }}>
+                  {Object.keys(PLAN_ACTIVITY).map((d) => <option key={d} value={d}>{d}</option>)}
+                </select>
+                {plan.day === "騎車" && (
+                  <React.Fragment>
+                    <input type="number" inputMode="decimal" value={plan.hours} min="0.5" step="0.5"
+                      onChange={(e) => applyPlan({ ...plan, hours: e.target.value })}
+                      aria-label="騎車時數" className="text-sm px-2 py-1 text-right"
+                      style={{ width: 52, borderRadius: 10, border: `2px solid ${T.track}`, background: T.bg, color: T.brown }} />
+                    <span className="text-xs" style={{ color: T.lightBrown }}>小時</span>
+                  </React.Fragment>
+                )}
+              </div>
+              {planMsg && (
+                <div className="text-xs mt-2" style={{ color: T.red, fontWeight: 700 }}>{planMsg}</div>
+              )}
             </div>
 
             {/* 四餐卡片 */}
