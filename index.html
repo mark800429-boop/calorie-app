@@ -451,7 +451,14 @@
       // ---------- 雲端同步管理 ----------
       const saveSyncUrl = () => {
         const u = syncInput.trim();
-        if (!u) return;
+        if (!u) {
+          setSyncMsg("先把同步網址貼到上面的框框,再按「開啟同步」");
+          return;
+        }
+        if (!/^https:\/\/script\.google\.com\/.+key=/.test(u)) {
+          setSyncMsg("網址看起來不對:要是 https://script.google.com/ 開頭、含 key= 的完整網址");
+          return;
+        }
         localStorage.setItem(SYNC_URL_STORAGE, u);
         setSyncUrl(u);
         setSyncInput("");
@@ -1101,6 +1108,9 @@ ${NUTRI_JSON}
                     <button onClick={saveSyncUrl} className="w-full py-3 text-base" style={btnStyle}>
                       開啟同步
                     </button>
+                    {syncMsg && (
+                      <div className="text-sm mt-2" style={{ color: T.red, fontWeight: 700 }}>{syncMsg}</div>
+                    )}
                   </div>
                 )}
               </div>
