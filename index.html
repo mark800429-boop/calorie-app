@@ -384,6 +384,9 @@
       // 一次選多張：每張 { key, preview, imageData, thumb, status: ready|analyzing|done|error, result, error }
       const [batch, setBatch] = useState([]);
       const [batchRunning, setBatchRunning] = useState(false);
+      // 「吃過的」勾選多筆：存 food_name 清單；recentAdded 是剛加入幾筆（顯示完成訊息用）
+      const [recentPicked, setRecentPicked] = useState([]);
+      const [recentAdded, setRecentAdded] = useState(0);
       const cameraRef = useRef(null);
       const galleryRef = useRef(null);
 
@@ -922,6 +925,26 @@ ${NUTRI_JSON}
         }, e.thumb);
       };
 
+      // 勾選的「吃過的」一次加入，每樣各記一筆，最後一次存檔
+      const addRecentPicked = async (list) => {
+        const picked = list.filter(({ entry }) => recentPicked.includes(entry.food_name));
+        if (!picked.length) return;
+        setError(null);
+        const now = new Date().toTimeString().slice(0, 5);
+        const entries = picked.map(({ entry: e }, i) => ({
+          id: `${Date.now()}-${i}`,
+          time: now,
+          food_name: e.food_name,
+          items: (e.items || []).map((it) => ({ ...it })),
+          confidence: e.confidence,
+          notes: "從吃過的紀錄再記一次",
+          thumb: e.thumb || null,
+        }));
+        await persist({ ...dayLog, [activeMeal]: [...(dayLog[activeMeal] || []), ...entries] });
+        setRecentPicked([]);
+        setRecentAdded(entries.length);
+      };
+
       const deleteEntry = async (mealId, entryId) => {
         const next = { ...dayLog, [mealId]: (dayLog[mealId] || []).filter((e) => e.id !== entryId) };
         await persist(next);
@@ -1009,6 +1032,8 @@ ${NUTRI_JSON}
         setFoodQuery("");
         setTextDesc("");
         setBatch([]);
+        setRecentPicked([]);
+        setRecentAdded(0);
       };
 
       // ---------- 樣式 ----------
@@ -1538,16 +1563,31 @@ ${NUTRI_JSON}
 
                   {manualTab === "recent" && (() => {
                     const list = recentFoods();
+                    const pickedSum = sumItems(list.filter(({ entry }) => recentPicked.includes(entry.food_name)).flatMap(({ entry }) => entry.items || []));
+                    const toggle = (name) => {
+                      setRecentAdded(0);
+                      setRecentPicked((p) => (p.includes(name) ? p.filter((x) => x !== name) : [...p, name]));
+                    };
                     return list.length === 0 ? (
                       <div className="text-xs" style={{ color: T.lightBrown }}>還沒有紀錄。</div>
                     ) : (
+                      <div>
+                      {recentAdded > 0 && (
+                        <div className="mb-2 px-3 py-2 text-sm"
+                          style={{ background: "#EDF5EC", color: T.green, borderRadius: 12, fontWeight: 800 }}>
+                          ✓ 已加入{meal ? meal.label : ""} {recentAdded} 筆
+                        </div>
+                      )}
+                      <div className="text-xs mb-1" style={{ color: T.lightBrown }}>點選要記的（可以選好幾樣），再按下面的「加入」</div>
                       <div style={{ maxHeight: 360, overflowY: "auto" }}>
                         {list.map(({ entry, count }) => {
                           const s = sumItems(entry.items);
+                          const on = recentPicked.includes(entry.food_name);
                           return (
-                            <button key={entry.food_name} onClick={() => addFromRecent(entry)}
+                            <button key={entry.food_name} onClick={() => toggle(entry.food_name)}
+                              aria-pressed={on}
                               className="w-full text-left py-2 px-1 flex items-center gap-2"
-                              style={{ borderBottom: `1px solid ${T.track}` }}>
+                              style={{ borderBottom: `1px solid ${T.track}`, background: on ? "#FDEBDD" : "transparent" }}>
                               {entry.thumb ? (
                                 <img src={entry.thumb} alt="" style={{ width: 36, height: 36, borderRadius: 10, objectFit: "cover" }} />
                               ) : (
@@ -1559,10 +1599,26 @@ ${NUTRI_JSON}
                                   吃過 {count} 次・🔥{Math.round(s.cal)} 🍞{round1(s.carbs)} 🍗{round1(s.protein)} 🥑{round1(s.fat)}
                                 </div>
                               </div>
-                              <span className="text-xs" style={{ color: T.orange, fontWeight: 800 }}>＋記一筆</span>
+                              <span aria-hidden="true" className="flex items-center justify-center"
+                                style={{
+                                  width: 26, height: 26, borderRadius: 999, flex: "none", fontWeight: 900, fontSize: 14,
+                                  border: `2px solid ${on ? T.orange : T.track}`,
+                                  background: on ? T.orange : T.card, color: "#FFF",
+                                }}>{on ? "✓" : ""}</span>
                             </button>
                           );
                         })}
+                      </div>
+                      {recentPicked.length > 0 && (
+                        <button onClick={() => addRecentPicked(list)} className="w-full py-3 mt-3 text-base" style={btnStyle}>
+                          加入 {recentPicked.length} 筆・🔥{Math.round(pickedSum.cal)} 大卡
+                        </button>
+                      )}
+                      {recentAdded > 0 && recentPicked.length === 0 && (
+                        <button onClick={() => setView("diary")} className="w-full py-3 mt-3 text-base" style={btnStyle}>
+                          ✓ 返回日記（可調份量）
+                        </button>
+                      )}
                       </div>
                     );
                   })()}
