@@ -371,6 +371,7 @@
       const [result, setResult] = useState(null);
       const [saved, setSaved] = useState(false);
       const [error, setError] = useState(null);
+      const setErrorGlobal = setError;
       // 沒拍到照片的記錄方式：db 資料庫／recent 吃過的／text 打字讓 AI 估
       const [manualTab, setManualTab] = useState(null);
       const [foodDb, setFoodDb] = useState(null);
@@ -380,6 +381,9 @@
       const [pickUnit, setPickUnit] = useState("g");
       const [pickSweet, setPickSweet] = useState(0);
       const [textDesc, setTextDesc] = useState("");
+      // 一次選多張：每張 { key, preview, imageData, thumb, status: ready|analyzing|done|error, result, error }
+      const [batch, setBatch] = useState([]);
+      const [batchRunning, setBatchRunning] = useState(false);
       const cameraRef = useRef(null);
       const galleryRef = useRef(null);
 
@@ -569,26 +573,33 @@
         return canvas.toDataURL("image/jpeg", quality);
       };
 
+      // 讀一張照片（HEIC 會先轉 JPEG），回傳送分析用的大圖與紀錄用的縮圖
+      const loadPhoto = async (file) => {
+        let img;
+        try {
+          img = await decodeImage(await readAsDataUrl(file));
+        } catch {
+          const heic2any = await loadHeic2any();
+          const jpegBlob = await heic2any({ blob: file, toType: "image/jpeg", quality: 0.85 });
+          img = await decodeImage(
+            await readAsDataUrl(Array.isArray(jpegBlob) ? jpegBlob[0] : jpegBlob)
+          );
+        }
+        const dataUrl = scaleTo(img, 720, 0.7);
+        return { preview: dataUrl, imageData: dataUrl.split(",")[1], thumb: scaleTo(img, 120, 0.6) };
+      };
+
       const processFile = async (file) => {
         setError(null);
         setResult(null);
         setSaved(false);
+        setBatch([]);
         setConverting(true);
         try {
-          let img;
-          try {
-            img = await decodeImage(await readAsDataUrl(file));
-          } catch {
-            const heic2any = await loadHeic2any();
-            const jpegBlob = await heic2any({ blob: file, toType: "image/jpeg", quality: 0.85 });
-            img = await decodeImage(
-              await readAsDataUrl(Array.isArray(jpegBlob) ? jpegBlob[0] : jpegBlob)
-            );
-          }
-          const dataUrl = scaleTo(img, 720, 0.7);
-          setImageData(dataUrl.split(",")[1]);
-          setPreviewUrl(dataUrl);
-          setThumb(scaleTo(img, 120, 0.6));
+          const p = await loadPhoto(file);
+          setImageData(p.imageData);
+          setPreviewUrl(p.preview);
+          setThumb(p.thumb);
         } catch {
           setError("這張照片無法讀取。備案:iPhone「設定 → 相機 → 格式」改「最相容」後重拍。");
         } finally {
@@ -620,8 +631,8 @@
 飲料、湯、牛奶等液體 unit 填 "ml",grams 欄位填毫升數;固體 unit 填 "g"。
 含糖飲料要把糖單獨列成一項,名稱寫「糖」或「果糖」;有寫甜度(半糖、微糖…)就照甜度,沒寫就以全糖估。`;
 
-      // 呼叫 Claude 估算營養，回傳解析好的 JSON；失敗時設定錯誤訊息並回傳 null
-      const askClaude = async (content) => {
+      // 呼叫 Claude 估算營養，回傳解析好的 JSON；失敗時用 setError（或多張模式傳進來的回報函式）顯示原因並回傳 null
+      const askClaude = async (content, setError = setErrorGlobal) => {
         const response = await fetch("https://api.anthropic.com/v1/messages", {
           method: "POST",
           headers: apiHeaders(),
@@ -707,6 +718,79 @@
             text: `你是營養分析師。請辨識照片中的食物,拆解成主要食材並估算營養。\n${NUTRI_JSON}\n如果照片中不是食物,回傳 {"error": "說明原因(繁體中文)"}。`,
           },
         ], thumb);
+      };
+
+      // ---------- 一次選多張照片 ----------
+      const BATCH_MAX = 10;
+      const PHOTO_PROMPT = `你是營養分析師。請辨識照片中的食物,拆解成主要食材並估算營養。\n${NUTRI_JSON}\n如果照片中不是食物,回傳 {"error": "說明原因(繁體中文)"}。`;
+
+      // 圖庫選了幾張：1 張走原本流程，2 張以上進多張模式
+      const onGalleryPick = async (fileList) => {
+        const files = Array.from(fileList || []);
+        if (!files.length) return;
+        if (files.length === 1) return processFile(files[0]);
+        setError(files.length > BATCH_MAX ? `一次最多 ${BATCH_MAX} 張,先處理前 ${BATCH_MAX} 張。` : null);
+        setResult(null);
+        setSaved(false);
+        setImageData(null);
+        setPreviewUrl(null);
+        setThumb(null);
+        setConverting(true);
+        const list = [];
+        for (const [i, f] of files.slice(0, BATCH_MAX).entries()) {
+          const key = `${Date.now()}-${i}`;
+          try {
+            list.push({ key, ...(await loadPhoto(f)), status: "ready" });
+          } catch {
+            list.push({ key, status: "error", error: "這張照片無法讀取" });
+          }
+        }
+        setBatch(list);
+        setConverting(false);
+      };
+
+      const updateBatchItem = (key, patch) =>
+        setBatch((b) => b.map((x) => (x.key === key ? { ...x, ...patch } : x)));
+
+      // 一張一張送分析，每成功一張就存一筆（中途關掉 App，已完成的也不會不見）
+      const analyzeBatch = async () => {
+        if (!apiKey) {
+          setView("settings");
+          return;
+        }
+        setBatchRunning(true);
+        setError(null);
+        let log = dayLog;
+        for (const item of batch) {
+          if (item.status !== "ready" && item.status !== "error") continue;
+          if (!item.imageData) continue;
+          updateBatchItem(item.key, { status: "analyzing", error: null });
+          let msg = null;
+          try {
+            const parsed = await askClaude([
+              { type: "image", source: { type: "base64", media_type: "image/jpeg", data: item.imageData } },
+              { type: "text", text: PHOTO_PROMPT },
+            ], (m) => { msg = m; });
+            if (!parsed) throw new Error(msg || "分析失敗");
+            const entry = {
+              id: `${Date.now()}-${item.key}`,
+              time: new Date().toTimeString().slice(0, 5),
+              food_name: parsed.food_name,
+              items: parsed.items || [],
+              confidence: parsed.confidence,
+              notes: parsed.notes,
+              thumb: item.thumb || null,
+            };
+            log = { ...log, [activeMeal]: [...(log[activeMeal] || []), entry] };
+            await persist(log);
+            updateBatchItem(item.key, { status: "done", result: parsed });
+          } catch (e) {
+            updateBatchItem(item.key, { status: "error", error: msg || `連線失敗(${e.message})` });
+            // 金鑰錯誤每張都會一樣，不必繼續
+            if (msg && msg.includes("金鑰")) { setError(msg); break; }
+          }
+        }
+        setBatchRunning(false);
       };
 
       // 沒拍到照片：用文字描述讓 AI 估（連鎖店餐點也適用）
@@ -924,6 +1008,7 @@ ${NUTRI_JSON}
         setPickedFood(null);
         setFoodQuery("");
         setTextDesc("");
+        setBatch([]);
       };
 
       // ---------- 樣式 ----------
@@ -1254,6 +1339,37 @@ ${NUTRI_JSON}
               <div className="w-full mb-4 overflow-hidden" style={cardStyle}>
                 {previewUrl ? (
                   <img src={previewUrl} alt="食物照片預覽" className="w-full object-cover" style={{ maxHeight: 300 }} />
+                ) : batch.length > 0 ? (
+                  <div className="p-3">
+                    <div className="text-sm mb-2" style={{ fontWeight: 900 }}>
+                      選了 {batch.length} 張,每張記成一筆
+                    </div>
+                    <div className="grid grid-cols-3 gap-2">
+                      {batch.map((b) => (
+                        <div key={b.key} style={{ position: "relative", borderRadius: 12, overflow: "hidden", background: T.track, aspectRatio: "1 / 1" }}>
+                          {b.preview && <img src={b.preview} alt="" className="w-full h-full object-cover" />}
+                          <div className="text-xs px-1 py-1"
+                            style={{
+                              position: "absolute", left: 0, right: 0, bottom: 0, fontWeight: 800, lineHeight: 1.3,
+                              background: "rgba(255,255,255,0.88)",
+                              color: b.status === "error" ? T.red : b.status === "done" ? T.green : T.brown,
+                            }}>
+                            {b.status === "ready" && "待分析"}
+                            {b.status === "analyzing" && "分析中…"}
+                            {b.status === "done" && `✓ ${b.result.food_name}・${Math.round(sumItems(b.result.items).cal)}大卡`}
+                            {b.status === "error" && `✕ ${b.error}`}
+                          </div>
+                          {!batchRunning && b.status !== "done" && (
+                            <button aria-label="移除這張"
+                              onClick={() => setBatch((x) => x.filter((y) => y.key !== b.key))}
+                              style={{ position: "absolute", top: 4, right: 4, width: 26, height: 26, borderRadius: 999, background: "rgba(74,52,42,0.75)", color: "#FFF", fontWeight: 800, lineHeight: "26px" }}>
+                              ✕
+                            </button>
+                          )}
+                        </div>
+                      ))}
+                    </div>
+                  </div>
                 ) : (
                   <div className="w-full py-12 flex flex-col items-center gap-4">
                     {converting ? (
@@ -1264,18 +1380,55 @@ ${NUTRI_JSON}
                           className="px-10 py-3 text-base" style={btnStyle}>📷 拍照</button>
                         <button onClick={() => galleryRef.current && galleryRef.current.click()}
                           className="px-10 py-3 text-base" style={btnOutline}>🖼️ 從圖庫選照片</button>
+                        <span className="text-xs" style={{ color: T.lightBrown }}>圖庫可以一次選好幾張,每張記成一筆</span>
                       </React.Fragment>
                     )}
                   </div>
                 )}
                 <input ref={cameraRef} type="file" accept="image/*" capture="environment" className="hidden"
-                  onChange={(e) => { const f = e.target.files && e.target.files[0]; if (f) processFile(f); }} />
-                <input ref={galleryRef} type="file" accept="image/*" className="hidden"
-                  onChange={(e) => { const f = e.target.files && e.target.files[0]; if (f) processFile(f); }} />
+                  onChange={(e) => { const f = e.target.files && e.target.files[0]; if (f) processFile(f); e.target.value = ""; }} />
+                <input ref={galleryRef} type="file" accept="image/*" multiple className="hidden"
+                  onChange={(e) => { onGalleryPick(e.target.files); e.target.value = ""; }} />
               </div>
 
+              {/* 多張模式的按鈕 */}
+              {batch.length > 0 && (() => {
+                const todo = batch.filter((b) => (b.status === "ready" || b.status === "error") && b.imageData).length;
+                const done = batch.filter((b) => b.status === "done");
+                const sum = sumItems(done.flatMap((b) => b.result.items || []));
+                return (
+                  <div className="mb-4">
+                    {done.length > 0 && (
+                      <div className="mb-3 px-3 py-2 text-sm"
+                        style={{ background: "#EDF5EC", color: T.green, borderRadius: 12, fontWeight: 800 }}>
+                        ✓ 已加入{MEALS.find((mm) => mm.id === activeMeal)?.label || ""} {done.length} 筆・共 {Math.round(sum.cal)} 大卡
+                      </div>
+                    )}
+                    {todo > 0 && (
+                      <button onClick={analyzeBatch} disabled={batchRunning} className="w-full py-3 mb-2 text-base"
+                        style={{ ...btnStyle, background: batchRunning ? T.lightBrown : T.orange }}>
+                        {batchRunning ? "分析中…（一張一張來,請別關掉）"
+                          : batch.some((b) => b.status === "error") ? `🔁 重試失敗的 ${todo} 張` : `🔥 全部分析並記錄（${todo} 張）`}
+                      </button>
+                    )}
+                    {!batchRunning && (
+                      <div className="flex gap-2">
+                        {done.length > 0 && (
+                          <button onClick={() => setView("diary")} className="flex-1 py-3 text-base" style={btnStyle}>
+                            ✓ 返回日記（可調份量）
+                          </button>
+                        )}
+                        <button onClick={() => openCapture(activeMeal)} className="px-4 py-3" style={btnOutline}>
+                          {done.length > 0 ? "再記一筆" : "重選"}
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                );
+              })()}
+
               {/* 沒拍到照片：資料庫、吃過的、打字讓 AI 估 */}
-              {!previewUrl && !saved && (
+              {!previewUrl && !saved && batch.length === 0 && (
                 <div className="w-full p-4 mb-4" style={cardStyle}>
                   <div className="text-sm mb-3" style={{ fontWeight: 900 }}>沒拍到照片？</div>
                   <div className="flex gap-2 mb-3">
