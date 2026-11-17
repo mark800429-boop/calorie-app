@@ -291,9 +291,11 @@
 
       // 把待上傳的日期一次送出（每批 20 天）；成功的從佇列拿掉
       const flushing = useRef(false);
+      const flushAgain = useRef(false);   // 上傳途中又有新修改，傳完要再送一輪
       const flushPending = async (extraDates = []) => {
         const url = localStorage.getItem(SYNC_URL_STORAGE);
-        if (!url || flushing.current) return null;
+        if (!url) return null;
+        if (flushing.current) { flushAgain.current = true; return null; }
         const dates = [...new Set([...loadPending(), ...extraDates])].sort();
         if (!dates.length) return 0;
         flushing.current = true;
@@ -302,20 +304,29 @@
         try {
           for (let i = 0; i < dates.length; i += 20) {
             const batch = dates.slice(i, i + 20);
+            // 記下送出當下每天的內容；傳完若內容已變（上傳途中又改了份量），那天留在佇列裡再送
+            const raw = {};
             const days = batch.map((d) => {
+              raw[d] = localStorage.getItem("app:log:" + d);
               let log = emptyLog();
-              try { log = JSON.parse(localStorage.getItem("app:log:" + d)) || log; } catch {}
+              try { log = JSON.parse(raw[d]) || log; } catch {}
               return { date: d, log: stripThumbs(log) };
             });
             await postSync(url, { days });
             sent += batch.length;
-            savePending(loadPending().filter((d) => !batch.includes(d)));
+            const done = batch.filter((d) => localStorage.getItem("app:log:" + d) === raw[d]);
+            savePending(loadPending().filter((d) => !done.includes(d)));
           }
           markStatus(true, `已上傳 ${sent} 天`);
         } catch (e) {
           markStatus(false, `上傳失敗（${e.message}），還有 ${loadPending().length} 天等著補送`);
         } finally {
           flushing.current = false;
+        }
+        // 上傳途中有新的修改，馬上再送一輪，免得最後一次修改沒上去
+        if (flushAgain.current) {
+          flushAgain.current = false;
+          if (loadPending().length) flushPending();
         }
         return sent;
       };
